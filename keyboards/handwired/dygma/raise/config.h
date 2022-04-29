@@ -30,5 +30,8 @@
 #define MATRIX_COLS 8
 /* The scanners already debounce for us */
 #define DEBOUNCE 0
+//#define QMK_KEYS_PER_SCAN 4
+//#define USB_POLLING_INTERVAL_MS 1
+//#define DEBUG_MATRIX_SCAN_RATE
 
 #define DRIVER_LED_TOTAL 132
