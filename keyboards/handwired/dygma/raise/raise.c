@@ -17,6 +17,9 @@
 #include "raise.h"
 
 void keyboard_post_init_kb(void) {
+#ifdef RGB_MATRIX_ENABLE
     set_all_leds_to(0, 0, 0);
+#endif
     keyboard_post_init_user();
+
 }
