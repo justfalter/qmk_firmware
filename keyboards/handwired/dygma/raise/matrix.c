@@ -32,6 +32,7 @@
 #define LEFT 0
 #define RIGHT 1
 #define WATCHDOG_MS 50
+#define CONSECUTIVE_HAND_READ_TIMEOUT_LIMIT 20
 /* If no key events have occurred, the scanners will time out on reads.
  * So we don't want to be too permissive here. */
 // TODO(ibash) not convinced this is needed...
@@ -41,8 +42,9 @@
 typedef enum { CHANGED, OFFLINE, UNCHANGED } read_hand_t;
 
 static read_hand_t last_state[2] = {OFFLINE, OFFLINE};
-static int hand_read_timeouts = 0;
-static int hand_read_not_timeouts = 0;
+static bool matrix_was_reset[2] = {false, false};
+static int consecutive_hand_read_timeouts = 0;
+static int consecutive_hand_offline_count[2] = {0,0};
 static bool i2c_pins_were_reset = false;
 
 static read_hand_t i2c_read_hand(int hand, matrix_row_t current_matrix[]) {
@@ -58,9 +60,9 @@ static read_hand_t i2c_read_hand(int hand, matrix_row_t current_matrix[]) {
     uint8_t      buf[ROWS_PER_HAND + 1];
     i2c_status_t ret = i2c_receive(I2C_ADDR(hand), buf, sizeof(buf), MY_I2C_TIMEOUT);
     if (ret == I2C_STATUS_TIMEOUT) {
-        hand_read_timeouts++;
+        consecutive_hand_read_timeouts++;
     } else {
-        hand_read_not_timeouts++;
+        consecutive_hand_read_timeouts = 0;
     }
 
     if (ret != I2C_STATUS_SUCCESS) {
@@ -133,19 +135,13 @@ static int i2c_get_keyscan_interval(int hand) {
 
 
 static uint32_t last_reset           = 0;
-static int left_offline_count        = 0;
-static int right_offline_count       = 0;
-static bool left_matrix_was_reset = false;
-static bool right_matrix_was_reset = false;
-static uint32_t last_watchdog = 0;
 
 void reinit_matrix(void) {
     last_reset = timer_read32();
-    last_watchdog = timer_read32();
-    left_offline_count = 0;
-    right_offline_count = 0;
-    left_matrix_was_reset = false;
-    right_matrix_was_reset = false;
+    // consecutive_hand_offline_count[LEFT] = 0;
+    // consecutive_hand_offline_count[RIGHT] = 0;
+    // matrix_was_reset[LEFT] = false;
+    // matrix_was_reset[RIGHT] = false;
     // ref: https://github.com/Dygmalab/Kaleidoscope/blob/7bac53de106c42ffda889e6854abc06cf43a3c6f/src/kaleidoscope/device/dygma/Raise.cpp#L83
     // ref: https://github.com/Dygmalab/Kaleidoscope/blob/7bac53de106c42ffda889e6854abc06cf43a3c6f/src/kaleidoscope/device/dygma/raise/Hand.cpp#L73
     int leftSetInterval = i2c_set_keyscan_interval(LEFT, 50);
@@ -176,6 +172,8 @@ void reset_i2c_pins(void) {
     wait_us(10);
     palSetLineMode(I2C1_SCL_PIN, PAL_MODE_ALTERNATE(I2C1_SCL_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
     palSetLineMode(I2C1_SDA_PIN, PAL_MODE_ALTERNATE(I2C1_SDA_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
+    consecutive_hand_read_timeouts = 0;
+    i2c_pins_were_reset = true;
 }
 
 void reset_matrix_for_hand(int hand, matrix_row_t current_matrix[]) {
@@ -196,26 +194,11 @@ bool matrix_scan_custom(matrix_row_t current_matrix[]) {
     wait_us(20);
     read_hand_t right_state = i2c_read_hand(RIGHT, current_matrix);
 
-    uint32_t timer_now = timer_read32();
-
-    if (TIMER_DIFF_32(timer_now, last_watchdog) >= WATCHDOG_MS) {
-        last_watchdog = timer_now;
-        if (hand_read_timeouts > 0 && hand_read_not_timeouts == 0) {
-            dprintf("All timeouts in last interval. Resetting pins.\n");
-            reset_i2c_pins();
-            wait_us(1000);
-            i2c_pins_were_reset = true;
-            reinit_matrix();
-        }
-        hand_read_timeouts = hand_read_not_timeouts = 0;
-    }
-
-
     bool force_matrix_has_changed = false;
 
     if (left_state == OFFLINE) {
         if (last_state[LEFT] == OFFLINE) {
-            left_offline_count++;
+            consecutive_hand_offline_count[LEFT]++;
         } else {
             dprintf("left just went offline.\n");
          //   wait_us(5000);
@@ -224,52 +207,57 @@ bool matrix_scan_custom(matrix_row_t current_matrix[]) {
 
     if (right_state == OFFLINE) {
         if (last_state[RIGHT] == OFFLINE) {
-            right_offline_count++;
+            consecutive_hand_offline_count[RIGHT]++;
         } else {
             dprintf("right just went offline.\n");
          //   wait_us(5000);
         }
     }
 
-    if (last_state[LEFT] == OFFLINE && left_offline_count == 10 && !left_matrix_was_reset) {
+    if (consecutive_hand_read_timeouts > CONSECUTIVE_HAND_READ_TIMEOUT_LIMIT) {
+        dprintf("Exceeded consecutive read timeout limit (%d). Resetting pins.\n", CONSECUTIVE_HAND_READ_TIMEOUT_LIMIT);
+        reset_i2c_pins();
+        wait_us(1000);
+        reinit_matrix();
+    }
+
+    if (last_state[LEFT] == OFFLINE && consecutive_hand_offline_count[LEFT] == 10 && !matrix_was_reset[LEFT]) {
         dprintf("left has been offline for 10 scans in a row - resetting its matrix.\n");
         reset_matrix_for_hand(LEFT, current_matrix);
         force_matrix_has_changed = true;
-        left_matrix_was_reset = true;
+        matrix_was_reset[LEFT] = true;
     } 
 
-    if (last_state[RIGHT] == OFFLINE && right_offline_count == 10 && !right_matrix_was_reset) {
+    if (last_state[RIGHT] == OFFLINE && consecutive_hand_offline_count[RIGHT] == 10 && !matrix_was_reset[RIGHT]) {
         dprintf("right has been offline for 10 scans in a row - resetting its matrix.\n");
         reset_matrix_for_hand(RIGHT, current_matrix);
         force_matrix_has_changed = true;
-        right_matrix_was_reset = true;
+        matrix_was_reset[RIGHT] = true;
     }
 
-    if ((last_state[LEFT] == OFFLINE && left_state != OFFLINE && left_matrix_was_reset) || (last_state[RIGHT] == OFFLINE && right_state != OFFLINE && right_matrix_was_reset)) {
+
+    if ((last_state[LEFT] == OFFLINE && left_state != OFFLINE && matrix_was_reset[LEFT]) || (last_state[RIGHT] == OFFLINE && right_state != OFFLINE && matrix_was_reset[RIGHT])) {
+        uint32_t timer_now = timer_read32();
+
         if (TIMER_DIFF_32(timer_now, last_reset) >= 100) {
             dprintf("matrix_scan_custom reset: left_state: %d, right_state: %d\n", left_state, right_state);
             reinit_matrix();
         }
-    } else if (left_state == OFFLINE && right_state == OFFLINE && left_matrix_was_reset && right_matrix_was_reset && !i2c_pins_were_reset) {
+    }
+    /* else if (left_state == OFFLINE && right_state == OFFLINE && left_matrix_was_reset && right_matrix_was_reset && !i2c_pins_were_reset) {
         reset_i2c_pins();
         i2c_pins_were_reset = true;
         reinit_matrix();
-        /* TODO somehow hard-reset the i2c bus? Power cycle both hands? */
-        /*
-        uint32_t timer_now = timer_read32();
-        if (TIMER_DIFF_32(timer_now, last_reset) >= 100) {
-            dprintf("both sides offline! trying re-init...\n");
-            reinit_matrix();
-        }
-        */
-    }
+    }*/
 
     if (left_state != OFFLINE) {
-        left_offline_count = 0;
+        consecutive_hand_offline_count[LEFT] = 0;
+        matrix_was_reset[LEFT] = false;
     }
 
     if (right_state != OFFLINE) {
-        right_offline_count = 0;
+        consecutive_hand_offline_count[RIGHT] = 0;
+        matrix_was_reset[RIGHT] = false;
     }
 
     last_state[LEFT]  = left_state;
