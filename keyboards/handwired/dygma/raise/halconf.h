@@ -17,5 +17,9 @@
 #pragma once
 
 #define HAL_USE_I2C TRUE
+#define I2C1_SCL_PIN B6
+#define I2C1_SDA_PIN B7
+#define I2C1_SCL_PAL_MODE 4
+#define I2C1_SDA_PAL_MODE 4
 
 #include_next <halconf.h>
