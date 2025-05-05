@@ -86,10 +86,9 @@ static read_hand_t i2c_read_hand(int hand, matrix_row_t current_matrix[]) {
     return CHANGED;
 }
 
-static int i2c_set_keyscan_interval(int hand, int delay) {
+static i2c_status_t i2c_set_keyscan_interval(int hand, int delay) {
     uint8_t      buf[] = {TWI_CMD_KEYSCAN_INTERVAL, delay};
-    i2c_status_t ret   = i2c_transmit(I2C_ADDR(hand), buf, sizeof(buf), MY_I2C_TIMEOUT);
-    return ret;
+    return i2c_transmit(I2C_ADDR(hand), buf, sizeof(buf), MY_I2C_TIMEOUT);
 }
 
 
@@ -159,21 +158,92 @@ void matrix_init_custom(void) {
 
 
 void reset_i2c_pins(void) {
-    dprintf("RESETTING I2C PINS!\n");
     // Try releasing special pins for a short time
+    // https://www.nxp.com/docs/en/user-guide/UM10204.pdf 3.1.16:
+    //   In the unlikely event where the clock (SCL) is stuck LOW, the preferential procedure is
+    //   to reset the bus using the HW reset signal if your I2C devices have HW reset inputs. If
+    //   the I2C devices do not have HW reset inputs, cycle power to the devices to activate the
+    //   mandatory internal Power-On Reset (POR) circuit.
+    //   If the data line (SDA) is stuck LOW, the controller should send nine clock pulses. The
+    //   device that held the bus LOW should release it sometime within those nine clocks. If not,
+    //   then use the HW reset or cycle power to clear the bus.
+    //
+    // For now, let's just act like the SDA is stuck low.
+    // We're going to keep clocking things until 
+    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_INPUT);
     palSetLineMode(I2C1_SCL_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
-    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
-    palClearLine(I2C1_SCL_PIN);
-    palClearLine(I2C1_SDA_PIN);
-    wait_us(10);
-    palSetLine(I2C1_SCL_PIN);
-    wait_us(10);
-    palSetLine(I2C1_SDA_PIN);
-    wait_us(10);
+    bool sdaPin = false;
+    while (true) {
+        wait_us(5);
+        dprintf("RESETTING I2C PINS! (loop)\n");
+        sdaPin = palReadLine(I2C1_SDA_PIN);
+
+        if (sdaPin) {
+            dprintf("SDA pin is currently high, so it appears not to be stuck\n");
+            break;
+        }
+
+        dprintf("SDA pin is currently low, sending 9 clocks to hopefully resolve\n");
+        for (int i = 0; i < 9; i++) {
+            palClearLine(I2C1_SCL_PIN);
+            wait_us(5);
+            palSetLine(I2C1_SCL_PIN);
+            wait_us(5);
+        }
+
+        // i2c_status_t resLeft = i2c_set_keyscan_interval(LEFT, 50);
+        // wait_us(10);
+        // i2c_status_t resRight = i2c_set_keyscan_interval(RIGHT, 50);
+
+        // if (resLeft == I2C_STATUS_SUCCESS && resRight == I2C_STATUS_SUCCESS) {
+        //     dprintf("RESET I2C PINS SUCCESS!\n");
+        //     break;
+        // }
+    }
+
+    // The following wait just makes it easier to find things in the logic
+    wait_us(5000);
+    dprintf("Restoring pins back to i2c mode...\n");
+
     palSetLineMode(I2C1_SCL_PIN, PAL_MODE_ALTERNATE(I2C1_SCL_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
     palSetLineMode(I2C1_SDA_PIN, PAL_MODE_ALTERNATE(I2C1_SDA_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
     consecutive_hand_read_timeouts = 0;
     i2c_pins_were_reset = true;
+
+}
+
+void reset_i2c_pins2(void) {
+    // From : https://github.com/Dygmalab/Kaleidoscope/blob/b3df553c0af8db6ba63475b4d49b56d2adad6d51/src/kaleidoscope/device/dygma/raise/TWI.cpp#L85-L112
+    //try i2c bus recovery at 100kHz = 5uS high, 5uS low
+    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
+    palSetLine(ISC1_SDA_PIN); //keeping SDA high during recovery
+    palSetLineMode(I2C1_SCL_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
+    dprintf("RESETTING I2C PINS!\n");
+
+    for (int i = 0; i < 10; i++) {
+        palSetLine(I2C1_SCL_PIN);
+        wait_us(5);
+        palClearLine(I2C1_SCL_PIN);
+        wait_us(5);
+    }
+
+    //a STOP signal (SDA from low to high while CLK is high)
+    palClearLine(ISC1_SDA_PIN);
+    wait_us(5);
+    palSetLine(I2C1_SCL_PIN);
+    wait_us(2);
+    palSetLine(ISC1_SDA_PIN);
+    wait_us(2);
+
+    // The following wait just makes it easier to find things in the logic
+    // wait_us(5000);
+    dprintf("Restoring pins back to i2c mode...\n");
+
+    palSetLineMode(I2C1_SCL_PIN, PAL_MODE_ALTERNATE(I2C1_SCL_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
+    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_ALTERNATE(I2C1_SDA_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
+    consecutive_hand_read_timeouts = 0;
+    i2c_pins_were_reset = true;
+
 }
 
 void reset_matrix_for_hand(int hand, matrix_row_t current_matrix[]) {
@@ -251,11 +321,17 @@ bool matrix_scan_custom(matrix_row_t current_matrix[]) {
     }*/
 
     if (left_state != OFFLINE) {
+        if (consecutive_hand_offline_count[LEFT] > 0) {
+            dprintf("Left side came back online after %d scans.\n", consecutive_hand_offline_count[LEFT]);
+        }
         consecutive_hand_offline_count[LEFT] = 0;
         matrix_was_reset[LEFT] = false;
     }
 
     if (right_state != OFFLINE) {
+        if (consecutive_hand_offline_count[RIGHT] > 0) {
+            dprintf("Right side came back online after %d scans.\n", consecutive_hand_offline_count[RIGHT]);
+        }
         consecutive_hand_offline_count[RIGHT] = 0;
         matrix_was_reset[RIGHT] = false;
     }
