@@ -19,3 +19,6 @@
 #include "quantum.h"
 
 #include "leds.h"
+
+void debug_print_mike_data(void);
+void debug_reset_mike_data(void);

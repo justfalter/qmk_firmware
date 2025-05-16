@@ -22,6 +22,7 @@
 #include "debug.h"
 #include "timer.h"
 #include <hal.h>
+#include "gpio.h"
 
 // shifting << 1 is because drivers/chibios/i2c_master.h expects the address
 // shifted.
@@ -32,12 +33,14 @@
 #define LEFT 0
 #define RIGHT 1
 #define WATCHDOG_MS 50
-#define CONSECUTIVE_HAND_READ_TIMEOUT_LIMIT 20
+#define CONSECUTIVE_HAND_READ_TIMEOUT_LIMIT 2
 /* If no key events have occurred, the scanners will time out on reads.
  * So we don't want to be too permissive here. */
 // TODO(ibash) not convinced this is needed...
 #define MY_I2C_TIMEOUT 10
 #define ROWS_PER_HAND (MATRIX_ROWS / 2)
+
+#define ERR_TRIGGER_PIN A13
 
 typedef enum { CHANGED, OFFLINE, UNCHANGED } read_hand_t;
 
@@ -46,6 +49,59 @@ static bool matrix_was_reset[2] = {false, false};
 static int consecutive_hand_read_timeouts = 0;
 static int consecutive_hand_offline_count[2] = {0,0};
 static bool i2c_pins_were_reset = false;
+static int debug_pin_reset_count = 0;
+static int debug_i2c_read_timeout_count[2] = {0,0};
+static int debug_i2c_read_error_count[2] = {0,0};
+
+void debug_print_mike_data(void) {
+    dprintf("MIKE DEBUG:\npin_reset_count=%d\nleft_read_timeout=%d\nright_read_timeout=%d\nleft_read_error=%d\nright_read_error=%d\n", debug_pin_reset_count, debug_i2c_read_timeout_count[LEFT], debug_i2c_read_timeout_count[RIGHT], debug_i2c_read_error_count[LEFT], debug_i2c_read_error_count[RIGHT]);
+}
+
+void debug_reset_mike_data(void) {
+    debug_print_mike_data();
+    dprintf("resetting counts\n");
+    debug_pin_reset_count = 0;
+    debug_i2c_read_timeout_count[LEFT] = 0;
+    debug_i2c_read_timeout_count[RIGHT] = 0;
+    debug_i2c_read_error_count[LEFT] = 0;
+    debug_i2c_read_error_count[RIGHT] = 0;
+}
+
+void reset_i2c_pins(void) {
+    debug_pin_reset_count++;
+    // From : https://github.com/Dygmalab/Kaleidoscope/blob/b3df553c0af8db6ba63475b4d49b56d2adad6d51/src/kaleidoscope/device/dygma/raise/TWI.cpp#L85-L112
+    //try i2c bus recovery at 100kHz = 5uS high, 5uS low
+    palClearLine(ERR_TRIGGER_PIN);
+    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
+    palSetLine(I2C1_SDA_PIN); //keeping SDA high during recovery
+    palSetLineMode(I2C1_SCL_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
+    dprintf("RESETTING I2C PINS!\n");
+
+    for (int i = 0; i < 10; i++) {
+        palSetLine(I2C1_SCL_PIN);
+        wait_us(5);
+        palClearLine(I2C1_SCL_PIN);
+        wait_us(5);
+    }
+
+    //a STOP signal (SDA from low to high while CLK is high)
+    palClearLine(I2C1_SDA_PIN);
+    wait_us(5);
+    palSetLine(I2C1_SCL_PIN);
+    wait_us(2);
+    palSetLine(I2C1_SDA_PIN);
+    wait_us(2);
+
+    // The following wait just makes it easier to find things in the logic
+    // wait_us(5000);
+    dprintf("Restoring pins back to i2c mode...\n");
+
+    palSetLineMode(I2C1_SCL_PIN, PAL_MODE_ALTERNATE(I2C1_SCL_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
+    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_ALTERNATE(I2C1_SDA_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
+    palSetLine(ERR_TRIGGER_PIN);
+    consecutive_hand_read_timeouts = 0;
+    i2c_pins_were_reset = true;
+}
 
 static read_hand_t i2c_read_hand(int hand, matrix_row_t current_matrix[]) {
     // dygma raise firmware says online is true iff we get the number of
@@ -60,7 +116,10 @@ static read_hand_t i2c_read_hand(int hand, matrix_row_t current_matrix[]) {
     uint8_t      buf[ROWS_PER_HAND + 1];
     i2c_status_t ret = i2c_receive(I2C_ADDR(hand), buf, sizeof(buf), MY_I2C_TIMEOUT);
     if (ret == I2C_STATUS_TIMEOUT) {
+        debug_i2c_read_timeout_count[hand]++;
         consecutive_hand_read_timeouts++;
+    } else if (ret == I2C_STATUS_ERROR) {
+        debug_i2c_read_error_count[hand]++;
     } else {
         consecutive_hand_read_timeouts = 0;
     }
@@ -133,10 +192,10 @@ static int i2c_get_keyscan_interval(int hand) {
     */
 
 
-static uint32_t last_reset           = 0;
+static uint32_t last_reinit           = 0;
 
 void reinit_matrix(void) {
-    last_reset = timer_read32();
+    last_reinit = timer_read32();
     // consecutive_hand_offline_count[LEFT] = 0;
     // consecutive_hand_offline_count[RIGHT] = 0;
     // matrix_was_reset[LEFT] = false;
@@ -153,97 +212,11 @@ void matrix_init_custom(void) {
     dprintf("matrix_init_custom...\n");
     i2c_init();
 
+    palSetLineMode(ERR_TRIGGER_PIN, PAL_MODE_OUTPUT_PUSHPULL);
+
+    palSetLine(ERR_TRIGGER_PIN);
+
     reinit_matrix();
-}
-
-
-void reset_i2c_pins(void) {
-    // Try releasing special pins for a short time
-    // https://www.nxp.com/docs/en/user-guide/UM10204.pdf 3.1.16:
-    //   In the unlikely event where the clock (SCL) is stuck LOW, the preferential procedure is
-    //   to reset the bus using the HW reset signal if your I2C devices have HW reset inputs. If
-    //   the I2C devices do not have HW reset inputs, cycle power to the devices to activate the
-    //   mandatory internal Power-On Reset (POR) circuit.
-    //   If the data line (SDA) is stuck LOW, the controller should send nine clock pulses. The
-    //   device that held the bus LOW should release it sometime within those nine clocks. If not,
-    //   then use the HW reset or cycle power to clear the bus.
-    //
-    // For now, let's just act like the SDA is stuck low.
-    // We're going to keep clocking things until 
-    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_INPUT);
-    palSetLineMode(I2C1_SCL_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
-    bool sdaPin = false;
-    while (true) {
-        wait_us(5);
-        dprintf("RESETTING I2C PINS! (loop)\n");
-        sdaPin = palReadLine(I2C1_SDA_PIN);
-
-        if (sdaPin) {
-            dprintf("SDA pin is currently high, so it appears not to be stuck\n");
-            break;
-        }
-
-        dprintf("SDA pin is currently low, sending 9 clocks to hopefully resolve\n");
-        for (int i = 0; i < 9; i++) {
-            palClearLine(I2C1_SCL_PIN);
-            wait_us(5);
-            palSetLine(I2C1_SCL_PIN);
-            wait_us(5);
-        }
-
-        // i2c_status_t resLeft = i2c_set_keyscan_interval(LEFT, 50);
-        // wait_us(10);
-        // i2c_status_t resRight = i2c_set_keyscan_interval(RIGHT, 50);
-
-        // if (resLeft == I2C_STATUS_SUCCESS && resRight == I2C_STATUS_SUCCESS) {
-        //     dprintf("RESET I2C PINS SUCCESS!\n");
-        //     break;
-        // }
-    }
-
-    // The following wait just makes it easier to find things in the logic
-    wait_us(5000);
-    dprintf("Restoring pins back to i2c mode...\n");
-
-    palSetLineMode(I2C1_SCL_PIN, PAL_MODE_ALTERNATE(I2C1_SCL_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
-    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_ALTERNATE(I2C1_SDA_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
-    consecutive_hand_read_timeouts = 0;
-    i2c_pins_were_reset = true;
-
-}
-
-void reset_i2c_pins2(void) {
-    // From : https://github.com/Dygmalab/Kaleidoscope/blob/b3df553c0af8db6ba63475b4d49b56d2adad6d51/src/kaleidoscope/device/dygma/raise/TWI.cpp#L85-L112
-    //try i2c bus recovery at 100kHz = 5uS high, 5uS low
-    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
-    palSetLine(ISC1_SDA_PIN); //keeping SDA high during recovery
-    palSetLineMode(I2C1_SCL_PIN, PAL_MODE_OUTPUT_OPENDRAIN);
-    dprintf("RESETTING I2C PINS!\n");
-
-    for (int i = 0; i < 10; i++) {
-        palSetLine(I2C1_SCL_PIN);
-        wait_us(5);
-        palClearLine(I2C1_SCL_PIN);
-        wait_us(5);
-    }
-
-    //a STOP signal (SDA from low to high while CLK is high)
-    palClearLine(ISC1_SDA_PIN);
-    wait_us(5);
-    palSetLine(I2C1_SCL_PIN);
-    wait_us(2);
-    palSetLine(ISC1_SDA_PIN);
-    wait_us(2);
-
-    // The following wait just makes it easier to find things in the logic
-    // wait_us(5000);
-    dprintf("Restoring pins back to i2c mode...\n");
-
-    palSetLineMode(I2C1_SCL_PIN, PAL_MODE_ALTERNATE(I2C1_SCL_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
-    palSetLineMode(I2C1_SDA_PIN, PAL_MODE_ALTERNATE(I2C1_SDA_PAL_MODE) | PAL_OUTPUT_TYPE_OPENDRAIN);
-    consecutive_hand_read_timeouts = 0;
-    i2c_pins_were_reset = true;
-
 }
 
 void reset_matrix_for_hand(int hand, matrix_row_t current_matrix[]) {
@@ -287,7 +260,7 @@ bool matrix_scan_custom(matrix_row_t current_matrix[]) {
     if (consecutive_hand_read_timeouts > CONSECUTIVE_HAND_READ_TIMEOUT_LIMIT) {
         dprintf("Exceeded consecutive read timeout limit (%d). Resetting pins.\n", CONSECUTIVE_HAND_READ_TIMEOUT_LIMIT);
         reset_i2c_pins();
-        wait_us(1000);
+        wait_us(20);
         reinit_matrix();
     }
 
@@ -296,7 +269,7 @@ bool matrix_scan_custom(matrix_row_t current_matrix[]) {
         reset_matrix_for_hand(LEFT, current_matrix);
         force_matrix_has_changed = true;
         matrix_was_reset[LEFT] = true;
-    } 
+    }
 
     if (last_state[RIGHT] == OFFLINE && consecutive_hand_offline_count[RIGHT] == 10 && !matrix_was_reset[RIGHT]) {
         dprintf("right has been offline for 10 scans in a row - resetting its matrix.\n");
@@ -309,7 +282,7 @@ bool matrix_scan_custom(matrix_row_t current_matrix[]) {
     if ((last_state[LEFT] == OFFLINE && left_state != OFFLINE && matrix_was_reset[LEFT]) || (last_state[RIGHT] == OFFLINE && right_state != OFFLINE && matrix_was_reset[RIGHT])) {
         uint32_t timer_now = timer_read32();
 
-        if (TIMER_DIFF_32(timer_now, last_reset) >= 100) {
+        if (TIMER_DIFF_32(timer_now, last_reinit) >= 100) {
             dprintf("matrix_scan_custom reset: left_state: %d, right_state: %d\n", left_state, right_state);
             reinit_matrix();
         }
@@ -321,17 +294,17 @@ bool matrix_scan_custom(matrix_row_t current_matrix[]) {
     }*/
 
     if (left_state != OFFLINE) {
-        if (consecutive_hand_offline_count[LEFT] > 0) {
-            dprintf("Left side came back online after %d scans.\n", consecutive_hand_offline_count[LEFT]);
-        }
+        // if (consecutive_hand_offline_count[LEFT] > 0) {
+        //     dprintf("Left side came back online after %d scans.\n", consecutive_hand_offline_count[LEFT]);
+        // }
         consecutive_hand_offline_count[LEFT] = 0;
         matrix_was_reset[LEFT] = false;
     }
 
     if (right_state != OFFLINE) {
-        if (consecutive_hand_offline_count[RIGHT] > 0) {
-            dprintf("Right side came back online after %d scans.\n", consecutive_hand_offline_count[RIGHT]);
-        }
+        // if (consecutive_hand_offline_count[RIGHT] > 0) {
+        //     dprintf("Right side came back online after %d scans.\n", consecutive_hand_offline_count[RIGHT]);
+        // }
         consecutive_hand_offline_count[RIGHT] = 0;
         matrix_was_reset[RIGHT] = false;
     }
